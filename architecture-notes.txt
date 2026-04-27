@@ -1,0 +1,178 @@
+============================================================
+CONTENT BROADCASTING SYSTEM - ARCHITECTURE NOTES
+============================================================
+
+------------------------------------------------------------
+1. AUTHENTICATION & RBAC FLOW
+------------------------------------------------------------
+- JWT (jsonwebtoken) is used for stateless authentication.
+- On login, a signed token containing { id, role } is issued.
+- Every protected route passes through the `authenticate` middleware,
+  which verifies the token and attaches req.user.
+- The `authorize(...roles)` middleware sits after authenticate and
+  checks req.user.role against the allowed roles for that route.
+- Roles are strictly separated:
+    Teacher   → upload content, view own content
+    Principal → view all content, approve/reject content
+- The public broadcast endpoint /content/live/:teacherId requires
+  NO authentication — it is open for students.
+
+------------------------------------------------------------
+2. SUBJECT-BASED SYSTEM DESIGN
+------------------------------------------------------------
+- Every piece of content belongs to a subject (maths, science, etc.).
+- When content is uploaded, the system finds (or creates) a row in
+  `content_slots` for that subject.
+- A row in `content_schedules` maps content → slot with a rotation_order
+  and duration.
+- This design means subjects are self-describing — no pre-seeding of
+  subjects is needed. A new subject slot is created on first upload.
+
+------------------------------------------------------------
+3. UPLOAD HANDLING APPROACH
+------------------------------------------------------------
+- multer handles multipart/form-data file uploads.
+- Storage: disk storage, saved to /uploads/ with a timestamp+random name
+  to avoid collisions.
+- Validation in multer fileFilter: MIME type must be image/jpeg, image/png,
+  or image/gif.
+- File size: 10 MB hard limit enforced by multer limits.fileSize.
+- File metadata (path, url, type, size) is stored in the content table.
+- Files are served statically via Express at GET /uploads/:filename.
+
+------------------------------------------------------------
+4. APPROVAL WORKFLOW DESIGN
+------------------------------------------------------------
+Content states: pending → approved | rejected
+
+- Newly uploaded content is always status='pending'.
+- Only a principal (verified via RBAC) can call PATCH /:id/approve or
+  PATCH /:id/reject.
+- Rejection requires a non-empty rejection_reason.
+- approved_by and approved_at are recorded for audit.
+- Rejected content stores the rejection_reason so the teacher can see why.
+- Only approved content ever reaches the public broadcasting API.
+
+------------------------------------------------------------
+5. SCHEDULING / ROTATION LOGIC (VERY IMPORTANT)
+------------------------------------------------------------
+Algorithm (in src/services/scheduling.service.js):
+
+Step 1: Query content where:
+  - uploaded_by = teacher_id
+  - status = 'approved'
+  - start_time IS NOT NULL AND end_time IS NOT NULL
+  - NOW() BETWEEN start_time AND end_time
+
+Step 2: Group results by subject.
+
+Step 3: For each subject group:
+  a. Fetch the corresponding content_slot row.
+  b. Fetch all content_schedules for that slot (joined with content)
+     ordered by rotation_order ASC.
+  c. Filter schedules to only those whose content is currently active.
+  d. Compute:
+       earliestStartMs = MIN(start_time) across active items
+       totalCycleMs    = SUM(duration * 60 * 1000) across active items
+       elapsed         = (now - earliestStartMs) % totalCycleMs
+  e. Walk the schedules in rotation_order order, accumulating duration.
+     The item whose window contains `elapsed` is the current active item.
+
+Step 4: Return one active item per subject.
+
+This is a stateless, database-driven approach — no cron jobs, no in-memory
+state. Every API call recomputes the active item from the current timestamp.
+This means the system is horizontally scalable: any number of server
+instances will always agree on which content is active.
+
+Edge cases handled:
+  - No approved content          → return empty list (message: "No content available")
+  - Approved but outside window  → filtered out in SQL query
+  - No start_time/end_time       → filtered out in SQL query (content not active)
+  - Invalid/unknown teacherId    → return empty list (not an error)
+  - Invalid subject filter       → return empty list (not an error)
+
+------------------------------------------------------------
+6. DATABASE DESIGN DECISIONS
+------------------------------------------------------------
+Tables:
+  users             → identity + role
+  content           → the main content record with scheduling fields
+  content_slots     → one row per subject (rotation group anchor)
+  content_schedules → links content to slot with rotation_order & duration
+
+Why separate content_slots and content_schedules?
+  - Allows each subject to have an independent rotation sequence.
+  - rotation_order in content_schedules determines broadcast order within a subject.
+  - duration in content_schedules can differ per item even within the same subject.
+  - UNIQUE(content_id, slot_id) prevents duplicate schedule entries.
+
+Key indexes:
+  - content(uploaded_by)       → fast teacher queries
+  - content(status)            → fast pending/approved queries
+  - content(subject)           → fast subject filtering
+  - content_schedules(slot_id) → fast rotation lookups
+
+------------------------------------------------------------
+7. FOLDER STRUCTURE
+------------------------------------------------------------
+src/
+  app.js              → Express app wiring, middleware, server startup
+  config/
+    db.js             → PostgreSQL pool
+    schema.sql        → DDL (all 4 tables + indexes)
+    migrate.js        → Runs schema.sql on startup
+  controllers/
+    auth.controller.js      → register, login
+    content.controller.js   → upload, getMyContent, getAllContent, approve, reject
+    broadcast.controller.js → getLiveContent (public)
+  routes/
+    auth.routes.js     → POST /auth/register, /auth/login
+    content.routes.js  → all /content/* routes
+  services/
+    auth.service.js        → register + login business logic
+    content.service.js     → upload business logic
+    approval.service.js    → approve/reject business logic
+    scheduling.service.js  → rotation algorithm
+  middlewares/
+    auth.middleware.js    → authenticate (JWT verify) + authorize (RBAC)
+    upload.middleware.js  → multer config (storage, filter, limits)
+    errorHandler.js       → global express error handler
+  models/
+    user.model.js    → SQL queries for users table
+    content.model.js → SQL queries for content table
+    slot.model.js    → SQL queries for content_slots + content_schedules
+  utils/             → (reserved for future helpers)
+
+------------------------------------------------------------
+8. MIDDLEWARE USAGE
+------------------------------------------------------------
+- cors           → enables cross-origin requests (open for students)
+- express.json   → parses JSON request bodies
+- authenticate   → verifies JWT, sets req.user
+- authorize()    → role check after authenticate
+- upload.single  → multer for single file upload on POST /content/upload
+- broadcastLimiter → express-rate-limit on /content/live (60 req/min)
+- errorHandler   → catches all next(err) calls, formats consistent responses
+
+------------------------------------------------------------
+9. SCALABILITY APPROACH
+------------------------------------------------------------
+Current (implemented):
+  - Stateless JWT auth → any instance can verify tokens
+  - Stateless scheduling → computed on-the-fly, no shared cron state
+  - Rate limiting on public endpoint → prevents abuse
+  - DB indexes on hot columns
+
+Future (bonus/production):
+  - Redis cache: Cache /content/live/:teacherId responses with short TTL
+    (e.g. 30s). Invalidate on approve/reject. Dramatically reduces DB load
+    for high-traffic broadcast endpoints.
+  - S3/CDN: Move file storage from local disk to S3 so multiple server
+    instances share the same file store.
+  - Queue (Bull/BullMQ): File processing or notification jobs can be
+    offloaded to a worker queue.
+  - Read replicas: content reads can be split to a read replica.
+  - Pagination: Already queryable via filters; add LIMIT/OFFSET for large
+    datasets.
+============================================================
