@@ -9,6 +9,9 @@ async function runMigrations() {
     console.log('Database schema applied successfully');
   } catch (err) {
     console.error('Migration error:', err.message);
+    console.error('Migration error stack:', err.stack);
+    console.error('DB config — DATABASE_URL present:', !!process.env.DATABASE_URL);
+    console.error('DB config — DB_HOST:', process.env.DB_HOST);
     throw err;
   }
 }
